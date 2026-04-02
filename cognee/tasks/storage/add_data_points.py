@@ -117,6 +117,17 @@ async def add_data_points(
     await graph_engine.add_edges(edges)
     await index_graph_edges(edges, vector_engine=vector_engine)
 
+    # CYPHER FORK: Cross-document edge linking
+    # After storing new nodes, find existing nodes with same name but different IDs
+    # and create "same_as" edges to connect them (solves cross-batch isolation)
+    try:
+        cross_edges = await _link_cross_document_nodes(nodes, graph_engine)
+        if cross_edges:
+            await graph_engine.add_edges(cross_edges)
+            logger.info(f"CYPHER FORK: Created {len(cross_edges)} cross-document edges")
+    except Exception as e:
+        logger.warning(f"CYPHER FORK: Cross-document linking failed (non-blocking): {e}")
+
     if isinstance(custom_edges, list) and custom_edges:
         # This must be handled separately from datapoint edges, created a task in linear to dig deeper but (COG-3488)
         custom_edges = ensure_default_edge_properties(custom_edges)
@@ -257,3 +268,86 @@ def _create_triplets_from_graph(nodes: List[DataPoint], edges: List[tuple]) -> L
         )
 
     return triplets
+
+
+async def _link_cross_document_nodes(new_nodes: List[DataPoint], graph_engine) -> list:
+    """
+    CYPHER FORK: Find existing nodes with same name as new nodes and create
+    'same_as' edges to connect them across documents.
+
+    Cognee's cognify() creates edges only between nodes from the same batch.
+    This function bridges the gap by connecting new nodes to their existing
+    counterparts in the graph (matched by name, case-insensitive).
+
+    Only connects nodes where:
+    - Same name (lowercased)
+    - Different IDs
+    - The existing node has more edges (is the "hub")
+    - The new node has few edges (is "isolated")
+    """
+    try:
+        all_nodes_data, all_edges_data = await graph_engine.get_graph_data()
+    except Exception:
+        return []
+
+    # Build lookup: name → list of (id, edge_count)
+    edge_count = {}
+    existing_edges = set()
+    for edge in all_edges_data:
+        if isinstance(edge, tuple) and len(edge) >= 3:
+            src, tgt = str(edge[0]), str(edge[1])
+            existing_edges.add((src, tgt))
+            edge_count[src] = edge_count.get(src, 0) + 1
+            edge_count[tgt] = edge_count.get(tgt, 0) + 1
+
+    name_to_nodes = {}
+    for node_id, info in all_nodes_data:
+        name = info.get("name", "").lower().strip()
+        if name:
+            nid = str(node_id)
+            if name not in name_to_nodes:
+                name_to_nodes[name] = []
+            name_to_nodes[name].append((nid, edge_count.get(nid, 0)))
+
+    # For each new node, find existing hub with same name
+    new_node_ids = {str(n.id) for n in new_nodes if hasattr(n, "id")}
+    cross_edges = []
+
+    for node in new_nodes:
+        if not hasattr(node, "name") or not node.name:
+            continue
+
+        name = node.name.lower().strip()
+        nid = str(node.id)
+        candidates = name_to_nodes.get(name, [])
+
+        if len(candidates) < 2:
+            continue
+
+        # Find the hub (most connected node with this name)
+        hub_id, hub_ec = max(candidates, key=lambda x: x[1])
+
+        # Don't connect to self or if already connected
+        if hub_id == nid or hub_ec == 0:
+            continue
+        if (nid, hub_id) in existing_edges or (hub_id, nid) in existing_edges:
+            continue
+
+        # Only connect if the new node is relatively isolated
+        my_ec = edge_count.get(nid, 0)
+        if my_ec > 5:
+            continue
+
+        cross_edges.append((
+            nid,
+            hub_id,
+            "same_as",
+            {
+                "relationship_name": "same_as",
+                "source_node_id": nid,
+                "target_node_id": hub_id,
+                "source": "cypher_fork_cross_doc_linker",
+            },
+        ))
+
+    return cross_edges

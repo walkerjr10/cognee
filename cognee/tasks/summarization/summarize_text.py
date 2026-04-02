@@ -74,6 +74,8 @@ async def summarize_text(
             id=uuid5(chunk.id, "TextSummary"),
             made_from=chunk,
             text=chunk_summaries[chunk_index].summary,
+            # CYPHER FORK: preserve original text for full-text retrieval
+            original_text=chunk.text,
         )
         for (chunk_index, chunk) in enumerate(non_dlt_chunks)
     ]

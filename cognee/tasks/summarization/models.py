@@ -8,15 +8,15 @@ class TextSummary(DataPoint):
     """
     Represent a text summary derived from a document chunk.
 
-    This class encapsulates a text summary as well as its associated metadata. The public
-    instance variables include 'text' for the summary content and 'made_from' which
-    indicates the source document chunk. The 'metadata' instance variable contains
-    additional information such as indexed fields.
+    CYPHER FORK: Added 'original_text' field to preserve the full original
+    text before summarization. The 'text' field contains the summary,
+    'original_text' contains the unmodified source text.
     """
 
     text: str
+    original_text: str = ""  # CYPHER FORK: full original text preserved
     made_from: DocumentChunk
-    metadata: dict = {"index_fields": ["text"]}
+    metadata: dict = {"index_fields": ["text", "original_text"]}
 
 
 class CodeSummary(DataPoint):
